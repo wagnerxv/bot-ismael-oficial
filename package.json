@@ -1,0 +1,16 @@
+{
+    "name": "bot-ismael-api-oficial",
+    "version": "1.0.0",
+    "description": "Chatbot para Ismael Motorista usando a API Oficial do WhatsApp na Vercel",
+    "main": "api/index.js",
+    "scripts": {
+      "start": "node api/index.js"
+    },
+    "dependencies": {
+      "@vercel/kv": "^1.0.1",
+      "axios": "^1.6.8",
+      "express": "^4.19.2",
+      "moment": "^2.30.1"
+    }
+  }
+  
