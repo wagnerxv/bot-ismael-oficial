@@ -11,7 +11,7 @@ app.use(express.json());
 
 // --- Variáveis de Ambiente (Configure na Vercel) ---
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN; // Crie qualquer senha aqui
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WHATSAPP_API_VERSION = 'v19.0';
 const WHATSAPP_PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
 const MOTORISTA_WHATSAPP_NUMBER = `55${MOTORISTA_CONFIG.telefone.replace(/\D/g, '')}`;
@@ -23,9 +23,12 @@ const kv = createClient({
 
 // --- Rota de Verificação do Webhook ---
 app.get('/api/webhook', (req, res) => {
+  console.log('Recebida verificação de webhook...');
   if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === VERIFY_TOKEN) {
+    console.log('Webhook verificado com sucesso!');
     res.status(200).send(req.query['hub.challenge']);
   } else {
+    console.error('Falha na verificação do webhook. Tokens não correspondem.');
     res.status(403).send('Forbidden');
   }
 });
@@ -33,43 +36,76 @@ app.get('/api/webhook', (req, res) => {
 // --- Rota para Receber Mensagens ---
 app.post('/api/webhook', async (req, res) => {
   const data = req.body;
-  if (data.object === 'whatsapp_business_account') {
-    const entry = data.entry[0];
-    if (entry.changes) {
-      const change = entry.changes[0];
-      if (change.value.messages) {
-        const message = change.value.messages[0];
-        const from = message.from;
-        
-        // Extrai a resposta do usuário (texto ou clique em botão/lista)
-        let userResponse;
-        if (message.type === 'text') {
-          userResponse = message.text.body;
-        } else if (message.type === 'interactive') {
-          const interactive = message.interactive;
-          userResponse = interactive.button_reply ? interactive.button_reply.id : interactive.list_reply.id;
-        }
+  
+  try {
+    if (data.object === 'whatsapp_business_account') {
+      const entry = data.entry?.[0];
+      if (entry && entry.changes) {
+        const change = entry.changes[0];
+        if (change.field === 'messages' && change.value.messages) {
+          const message = change.value.messages[0];
+          const from = message.from;
+          
+          let userResponse;
+          let messageType = message.type;
 
-        if (userResponse) {
-          await processarMensagem(from, userResponse);
+          if (messageType === 'text') {
+            userResponse = message.text.body;
+          } else if (messageType === 'interactive') {
+            const interactive = message.interactive;
+            userResponse = interactive.button_reply ? interactive.button_reply.id : interactive.list_reply.id;
+          }
+
+          if (userResponse) {
+            console.log(`Mensagem recebida de ${from}: "${userResponse}"`);
+            await processarMensagem(from, userResponse, messageType);
+          }
         }
       }
     }
+    res.status(200).send('EVENT_RECEIVED');
+  } catch (error) {
+    console.error('Erro no webhook principal:', error);
+    res.status(500).send('Internal Server Error');
   }
-  res.status(200).send('EVENT_RECEIVED');
 });
 
+
 // --- Lógica Principal do Chatbot ---
-async function processarMensagem(de, mensagem) {
+async function processarMensagem(de, mensagem, tipoMensagem) {
   let sessao = await kv.get(de) || { etapa: 'boas_vindas', dados: {} };
   
-  if (mensagem === 'cancelar_tudo') {
+  if (mensagem.toLowerCase() === 'cancelar') {
     await kv.del(de);
     await enviarMensagem(de, { type: 'text', text: { body: '❌ Atendimento cancelado. Se precisar de algo, é só chamar!' } });
     return;
   }
 
-  try {
+  // Lógica para quando o bot espera um texto livre
+  const esperaTexto = ['aguardando_origem_texto', 'aguardando_destino_texto', 'aguardando_nome', 'aguardando_contato'].includes(sessao.etapa);
+  if (esperaTexto && tipoMensagem === 'text') {
+     switch (sessao.etapa) {
+        case 'aguardando_origem_texto':
+            sessao.dados.origem = mensagem;
+            sessao.etapa = 'destino';
+            await sessaoDestino(de, sessao);
+            break;
+        case 'aguardando_destino_texto':
+            sessao.dados.destino = mensagem;
+            sessao.etapa = 'passageiros';
+            await sessaoPassageiros(de, sessao);
+            break;
+        case 'aguardando_nome':
+            sessao.dados.nomeCliente = mensagem;
+            sessao.etapa = 'aguardando_contato';
+            await enviarMensagem(de, { type: 'text', text: { body: `Obrigado, ${mensagem}!\n\n📱 Agora, por favor, informe um número de telefone para contato (com DDD).` } });
+            break;
+        case 'aguardando_contato':
+            sessao.dados.contatoCliente = mensagem;
+            await sessaoFinal(de, sessao);
+            return; // Finaliza o fluxo
+     }
+  } else { // Lógica para cliques em botões/listas ou início de conversa
     switch (sessao.etapa) {
       case 'boas_vindas':
         await sessaoBoasVindas(de, sessao);
@@ -98,29 +134,18 @@ async function processarMensagem(de, mensagem) {
       case 'confirmacao':
         await processarConfirmacao(de, mensagem, sessao);
         break;
-      case 'aguardando_nome':
-        sessao.dados.nomeCliente = mensagem; // Aqui a `mensagem` é o texto digitado
-        sessao.etapa = 'aguardando_contato';
-        await enviarMensagem(de, { type: 'text', text: { body: `Obrigado, ${mensagem}!\n\n📱 Agora, por favor, informe um número de telefone para contato (com DDD).` } });
-        break;
-      case 'aguardando_contato':
-        sessao.dados.contatoCliente = mensagem;
-        await sessaoFinal(de, sessao);
-        return; // Finaliza o fluxo aqui
     }
-    // Salva a sessão no banco de dados após cada etapa
-    await kv.set(de, sessao);
-  } catch (error) {
-     console.error('Erro no processamento da mensagem:', error);
-     await enviarMensagem(de, { type: 'text', text: { body: '⚠️ Ocorreu um erro. Tente novamente ou digite "cancelar" para recomeçar.' } });
   }
+  
+  await kv.set(de, sessao);
 }
+
 
 // --- Funções de Etapa do Fluxo ---
 
 async function sessaoBoasVindas(de, sessao) {
   sessao.etapa = 'aguardando_inicio';
-  const mensagem = {
+  const payload = {
     type: 'interactive',
     interactive: {
       type: 'button',
@@ -134,7 +159,7 @@ async function sessaoBoasVindas(de, sessao) {
       }
     }
   };
-  await enviarMensagem(de, mensagem);
+  await enviarMensagem(de, payload);
 }
 
 async function processarOpcaoInicial(de, mensagem, sessao) {
@@ -161,7 +186,7 @@ async function sessaoOrigem(de, sessao) {
         { title: '🌾 Zona Rural', rows: Object.keys(LOCAIS_CONFIG.rurais).map(l => ({ id: `loc_${l}`, title: l })) },
         { title: '📝 Outro', rows: [{ id: 'outro_local', title: '✏️ Digitar outro endereço' }] }
     ];
-    const mensagem = {
+    const payload = {
         type: 'interactive',
         interactive: {
             type: 'list',
@@ -171,41 +196,19 @@ async function sessaoOrigem(de, sessao) {
             action: { button: 'Ver Locais', sections }
         }
     };
-    await enviarMensagem(de, mensagem);
+    await enviarMensagem(de, payload);
 }
 
 async function processarEscolhaOrigem(de, mensagem, sessao) {
     if (mensagem === 'outro_local') {
         sessao.etapa = 'aguardando_origem_texto';
         await enviarMensagem(de, { type: 'text', text: { body: 'Por favor, digite o endereço de partida:' } });
-        await kv.set(de, sessao); // Salva a etapa antes de aguardar o texto
-        return;
+    } else {
+        sessao.dados.origem = mensagem.replace('loc_', '');
+        sessao.etapa = 'destino';
+        await sessaoDestino(de, sessao);
     }
-    sessao.dados.origem = mensagem.replace('loc_', '');
-    sessao.etapa = 'destino';
-    await sessaoDestino(de, sessao);
 }
-
-// Adicionar uma nova etapa para tratar o texto da origem
-app.post('/api/webhook', async (req, res) => {
-  // ... (código de recebimento de mensagem)
-  let sessao = await kv.get(from);
-  if (sessao && sessao.etapa === 'aguardando_origem_texto') {
-      sessao.dados.origem = text;
-      sessao.etapa = 'destino';
-      await sessaoDestino(from, sessao);
-      await kv.set(from, sessao);
-  } else if (sessao && sessao.etapa === 'aguardando_destino_texto') {
-      sessao.dados.destino = text;
-      sessao.etapa = 'passageiros';
-      await sessaoPassageiros(from, sessao);
-      await kv.set(from, sessao);
-  } else if (userResponse) {
-      await processarMensagem(from, userResponse);
-  }
-  // ...
-});
-
 
 async function sessaoDestino(de, sessao) {
     sessao.etapa = 'aguardando_destino';
@@ -215,7 +218,7 @@ async function sessaoDestino(de, sessao) {
         { title: '🏙️ Cidades Vizinhas', rows: Object.keys(LOCAIS_CONFIG.vizinhas).map(l => ({ id: `loc_${l}`, title: l })) },
         { title: '📝 Outro', rows: [{ id: 'outro_local', title: '✏️ Digitar outro endereço' }] }
     ];
-    const mensagem = {
+    const payload = {
         type: 'interactive',
         interactive: {
             type: 'list',
@@ -224,24 +227,23 @@ async function sessaoDestino(de, sessao) {
             action: { button: 'Ver Destinos', sections }
         }
     };
-    await enviarMensagem(de, mensagem);
+    await enviarMensagem(de, payload);
 }
 
 async function processarEscolhaDestino(de, mensagem, sessao) {
     if (mensagem === 'outro_local') {
         sessao.etapa = 'aguardando_destino_texto';
         await enviarMensagem(de, { type: 'text', text: { body: 'Por favor, digite o endereço de destino:' } });
-        await kv.set(de, sessao);
-        return;
+    } else {
+        sessao.dados.destino = mensagem.replace('loc_', '');
+        sessao.etapa = 'passageiros';
+        await sessaoPassageiros(de, sessao);
     }
-    sessao.dados.destino = mensagem.replace('loc_', '');
-    sessao.etapa = 'passageiros';
-    await sessaoPassageiros(de, sessao);
 }
 
 async function sessaoPassageiros(de, sessao) {
     sessao.etapa = 'aguardando_passageiros';
-    const mensagem = {
+    const payload = {
         type: 'interactive',
         interactive: {
             type: 'button',
@@ -250,12 +252,12 @@ async function sessaoPassageiros(de, sessao) {
                 buttons: [
                     { type: 'reply', reply: { id: 'pass_1', title: '1 Passageiro' } },
                     { type: 'reply', reply: { id: 'pass_2', title: '2 Passageiros' } },
-                    { type: 'reply', reply: { id: 'pass_3', title: '3 Passageiros' } },
+                    { type: 'reply', reply: { id: 'pass_3', title: '3 ou mais' } },
                 ]
             }
         }
     };
-    await enviarMensagem(de, mensagem);
+    await enviarMensagem(de, payload);
 }
 
 async function processarEscolhaPassageiros(de, mensagem, sessao) {
@@ -278,7 +280,7 @@ async function mostrarCotacao(de, sessao) {
         `⏱️ *Tempo Estimado:* ${cotacao.tempoEstimado} minutos\n\n` +
         `Tudo certo para confirmar?`;
 
-    const mensagem = {
+    const payload = {
         type: 'interactive',
         interactive: {
             type: 'button',
@@ -291,7 +293,7 @@ async function mostrarCotacao(de, sessao) {
             }
         }
     };
-    await enviarMensagem(de, mensagem);
+    await enviarMensagem(de, payload);
 }
 
 async function processarConfirmacao(de, mensagem, sessao) {
@@ -299,9 +301,9 @@ async function processarConfirmacao(de, mensagem, sessao) {
         sessao.etapa = 'aguardando_nome';
         await enviarMensagem(de, { type: 'text', text: { body: '📝 *Ótimo! Para finalizar, qual o seu nome completo?*' } });
     } else if (mensagem === 'fazer_cotacao') {
-        sessao.etapa = 'origem';
+        sessao.etapa = 'boas_vindas';
         sessao.dados = {};
-        await sessaoOrigem(de, sessao);
+        await sessaoBoasVindas(de, sessao);
     }
 }
 
@@ -322,7 +324,6 @@ async function sessaoFinal(de, sessao) {
         status: 'confirmada'
     };
     
-    // Salva no banco de dados
     await kv.set(`corrida:${corrida.id}`, corrida);
 
     const confirmacaoFinalCliente = `✅ *VIAGEM CONFIRMADA!*\n\n` +
@@ -338,11 +339,10 @@ async function sessaoFinal(de, sessao) {
     
     await notificarMotorista(corrida);
 
-    await kv.del(de); // Limpa a sessão do usuário
+    await kv.del(de);
 }
 
 // --- Funções Auxiliares ---
-
 function calcularCotacao(dados) {
     let valorBase = 30;
     let tempoEstimado = 20;
@@ -376,8 +376,7 @@ async function mostrarTabelaPrecos(de) {
         `*Rurais:* a partir de R$ 35,00\n` +
         `*Cidades Vizinhas:* a partir de R$ 75,00\n\n` +
         `*Acréscimos por Passageiros:*\n` +
-        `• 3 passageiros: +20%\n` +
-        `• 4+ passageiros: +40%`;
+        `• 3 ou mais: +20%`;
     await enviarMensagem(de, { type: 'text', text: { body: tabela } });
 }
 
